@@ -43,10 +43,15 @@ export default function ForesightEngine() {
   const [optimizeResult, setOptimizeResult] = useState(null);
   const [forecastResult, setForecastResult] = useState(null);
   const [error, setError] = useState(null);
-  const containerRef  = useRef();
-  const heroRef        = useRef();
-  const videoRef       = useRef();
-  const videoWrapRef   = useRef();
+  const containerRef    = useRef();
+  const heroRef         = useRef();
+  const videoRef        = useRef();
+  const videoWrapRef    = useRef();
+  const scheduleFileRef = useRef();
+
+  // ── Schedule Upload State ──────────────────────────────────────────
+  const [scheduleFile, setScheduleFile] = useState(null); // { name, status: 'idle'|'uploading'|'done'|'error', msg }
+  const [isDragging, setIsDragging]     = useState(false);
 
   /* Claim the pre-warmed video from the pool — runs before GSAP */
   useWarmVideo(feHeroVideo, videoRef, videoWrapRef, 'ce-hero-video');
@@ -117,6 +122,68 @@ export default function ForesightEngine() {
       setIsTriggering(false);
     }
   }, []);
+
+  // ── Schedule File Upload & Parse ─────────────────────────────────
+  const handleScheduleFile = useCallback(async (file) => {
+    if (!file) return;
+    const allowed = ['.csv', '.mpp', '.xml', '.xer', '.xlsx'];
+    const ext = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
+    if (!allowed.includes(ext)) {
+      setScheduleFile({ name: file.name, status: 'error', msg: 'Unsupported format. Use CSV, MPP, XER, XML, or XLSX.' });
+      return;
+    }
+
+    setScheduleFile({ name: file.name, status: 'uploading', msg: 'Reading schedule file…' });
+
+    // Try to parse duration / cost from CSV; fall back to defaults
+    let baseDuration = 180;
+    let baseCost = 5_000_000;
+    if (ext === '.csv') {
+      try {
+        const text = await file.text();
+        const lines = text.split('\n').map(l => l.toLowerCase());
+        for (const line of lines) {
+          const durMatch = line.match(/duration[^,]*,\s*([\d.]+)/);
+          if (durMatch) baseDuration = Math.round(parseFloat(durMatch[1]));
+          const costMatch = line.match(/(?:cost|budget)[^,]*,\s*([\d.]+)/);
+          if (costMatch) baseCost = parseFloat(costMatch[1]);
+        }
+      } catch { /* ignore parse errors */ }
+    }
+
+    setScheduleFile({ name: file.name, status: 'uploading', msg: 'Running risk simulation…' });
+    setIsSimulating(true);
+    setError(null);
+    try {
+      const formData = new FormData();
+      formData.append('base_duration', String(baseDuration));
+      formData.append('base_cost', String(baseCost));
+      const response = await fetch(`${API_BASE}/api/v1/foresight/risk`, { method: 'POST', body: formData });
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.detail || `Server error: ${response.status}`);
+      }
+      const data = await response.json();
+      setRiskReport(data);
+      setScheduleFile({ name: file.name, status: 'done', msg: `Schedule parsed · ${baseDuration} days · ₹${(baseCost / 1e5).toFixed(1)}L budget` });
+    } catch (err) {
+      setError(err.message || 'Simulation failed.');
+      setScheduleFile({ name: file.name, status: 'error', msg: err.message || 'Simulation failed after upload.' });
+    } finally {
+      setIsSimulating(false);
+    }
+  }, []);
+
+  const onScheduleInputChange = useCallback((e) => {
+    handleScheduleFile(e.target.files?.[0]);
+    e.target.value = '';
+  }, [handleScheduleFile]);
+
+  const onDropzoneDrop = useCallback((e) => {
+    e.preventDefault();
+    setIsDragging(false);
+    handleScheduleFile(e.dataTransfer.files?.[0]);
+  }, [handleScheduleFile]);
 
   const toggleStat = (i) => setOpenStat(prev => (prev === i ? null : i));
 
@@ -358,9 +425,51 @@ export default function ForesightEngine() {
 
         <div className="ce-workspace-middle">
           <h2 className="ce-section-title" style={{ textAlign: 'center' }}>2. Upload Project Schedule (.mpp, .csv)</h2>
-          <div className="ce-dropzone">
-            <span className="ce-dropzone-text">Drop schedule file here or click to upload</span>
-            <span className="ce-dropzone-sub">Supports Primavera P6, MS Project, or CSV format</span>
+          {/* Hidden file input */}
+          <input
+            ref={scheduleFileRef}
+            type="file"
+            accept=".csv,.mpp,.xml,.xer,.xlsx"
+            style={{ display: 'none' }}
+            onChange={onScheduleInputChange}
+          />
+          <div
+            className="ce-dropzone"
+            onClick={() => !isSimulating && scheduleFileRef.current?.click()}
+            onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+            onDragLeave={() => setIsDragging(false)}
+            onDrop={onDropzoneDrop}
+            style={{
+              cursor: isSimulating ? 'not-allowed' : 'pointer',
+              opacity: isSimulating ? 0.7 : 1,
+              outline: isDragging ? '2px dashed #111' : 'none',
+              background: isDragging ? '#F5F5F5' : undefined,
+              transition: 'outline 0.15s, background 0.15s',
+            }}
+          >
+            {scheduleFile?.status === 'uploading' ? (
+              <>
+                <span className="ce-dropzone-text">⏳ {scheduleFile.msg}</span>
+                <AnalysisProgress steps={SIMULATION_STEPS} active={true} />
+              </>
+            ) : scheduleFile?.status === 'done' ? (
+              <>
+                <span className="ce-dropzone-text" style={{ color: '#2E7D32' }}>✓ {scheduleFile.name}</span>
+                <span className="ce-dropzone-sub">{scheduleFile.msg}</span>
+                <span className="ce-dropzone-sub">Click to upload a different schedule</span>
+              </>
+            ) : scheduleFile?.status === 'error' ? (
+              <>
+                <span className="ce-dropzone-text" style={{ color: '#C62828' }}>✗ Upload Failed</span>
+                <span className="ce-dropzone-sub">{scheduleFile.msg}</span>
+                <span className="ce-dropzone-sub">Click to try again</span>
+              </>
+            ) : (
+              <>
+                <span className="ce-dropzone-text">Drop schedule file here or click to upload</span>
+                <span className="ce-dropzone-sub">Supports Primavera P6, MS Project, or CSV format</span>
+              </>
+            )}
           </div>
         </div>
       </section>
